@@ -1,0 +1,142 @@
+# dsh-model-proxy
+
+Route DeepSeek Harness **model API requests** through a proxy so third-party overseas
+model providers work from mainland China, while **every other request stays direct**
+— web search, page fetching, MCP servers and tool calls never touch the proxy.
+
+- Does not patch any harness file; uninstalling restores the original behaviour exactly
+- **System proxy**, **custom proxy** (`http` / `https` / `socks4` / `socks4a` / `socks5` / `socks5h`), or env-based
+- **Global** or **per-domain** routing; domain rules accept exact hosts, wildcards and suffixes
+- Three safety guarantees that configuration cannot loosen (below)
+
+---
+
+## Install
+
+```bash
+dsh plugin --profile <your-profile> add github:recyvan/dsh-model-proxy
+```
+
+Restart DSH afterwards — the host half loads inside the harness process.
+
+### Conflict with `dsh-http-proxy`
+
+**Both plugins wrap `globalThis.fetch`, so install only one of them.**
+
+```bash
+dsh plugin --profile <your-profile> remove dsh-http-proxy
+```
+
+Two wrappers each keep their own "original fetch", so the one installed second wraps the
+first, and uninstalling in the wrong order restores an inconsistent chain. This plugin is a
+superset (system proxy, global mode, forced-direct ranges, plaintext gate, status page).
+
+---
+
+## Configure
+
+Open **Settings → Plugin configuration → "Model Proxy"**.
+
+| Field | Meaning |
+| --- | --- |
+| Mode | `rule` (recommended) / `system` / `custom` / `off` |
+| Proxy protocol | http / https / socks5 / socks5h / socks4 |
+| Proxy address | `socks5h://127.0.0.1:7890`, or just `127.0.0.1:7890` (scheme filled in from the protocol field) |
+| Proxy only these domains | empty = built-in preset; filled = proxy only these (comma separated, `*.openai.com`, `.aiplatform.googleapis.com`) |
+| Exclude domains | always direct, highest priority |
+
+Changes take effect on the next request — no restart.
+
+### Three common setups
+
+**A. Clash / V2Ray on `127.0.0.1:7890`, overseas APIs only**
+Mode = `rule`, protocol = `http`, address = `127.0.0.1:7890`, leave the domain list empty.
+The preset sends OpenAI / Anthropic / Gemini / xAI / Groq / OpenRouter and similar through
+the proxy, and keeps DeepSeek, DashScope, Zhipu, Kimi and other mainland providers direct.
+
+**B. Follow the Windows system proxy**
+Mode = `system`. The plugin re-reads
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` every 30 s and follows
+changes made in Windows.
+
+**C. Everything through the proxy, a few exceptions**
+Mode = `custom`, fill the address, list the exceptions under "Exclude domains".
+
+### Notes for overseas APIs from mainland China
+
+- **DNS poisoning**: prefer `socks5h` (DNS resolved by the proxy), or let your proxy client
+  take over DNS.
+- **Plaintext `http` is refused by default** — an API key must not travel over a proxy in
+  clear text. Tick the option in the settings card if you really need it.
+- The proxy must listen on loopback; enable the local/LAN listener in your proxy client.
+
+---
+
+## Verify
+
+1. The settings card shows live status: `path A · exit route · N rules · proxied x / direct y`.
+2. `http://127.0.0.1:<port>/dsh-model-proxy/status` returns the same snapshot as JSON
+   (loopback / same-origin only).
+3. `node test/run-all.mjs` — the suite is dependency-free.
+
+---
+
+## Safety guarantees
+
+These hold regardless of configuration, and are what the rules engine checks first:
+
+1. **Forced direct** — loopback, private ranges (`10/8`, `172.16/12`, `192.168/16`,
+   `169.254/16`, `fc00::/7`…), `localhost` and `.local`/`.lan`/`.internal` style names never go
+   through a proxy. User rules can add entries but cannot remove these.
+2. **Plaintext gate** — a model request that is not `https` is rejected before any socket is
+   opened, unless the option is explicitly enabled (the card then shows a standing warning).
+3. **Data minimisation** — the plugin passes request and response bodies through as streams;
+   it never parses them, never writes them to disk, and never reads `Authorization` or any
+   provider API key. Default logging records the exit id and error class only — no hostnames,
+   no paths, no bodies.
+
+A failed exit falls back to **direct**, never to another exit: silently moving traffic to a
+different exit would change the outbound identity without the user noticing.
+
+---
+
+## Development
+
+```
+lib/index.js       Cordis host entry — the only file that touches the harness API
+lib/client.js      settings card (`__ModuleLoader__` browser entry)
+lib/core/*         pure logic, no harness dependency, independently testable
+test/run-all.mjs   dependency-free test suite
+```
+
+`undici` is the only runtime dependency; `@deepseek-ai/schemastery` is a peer provided by the host.
+
+---
+
+## Limitations
+
+- Covers model requests issued through **`fetch`**. `transport: websocket` streaming and
+  provider native-SDK channels (e.g. Amazon Bedrock) do not pass through `fetch` and cannot be
+  proxied here — use the harness's built-in environment-variable proxy for those.
+- Routing is by **domain**. A domain that serves both a model API and other traffic sends all
+  of it through the proxy; list such domains under "Exclude domains".
+- Proxy credentials can only be embedded in the proxy address (`http://user:pass@host:port`),
+  which stores them in plain text in settings. Prefer letting the proxy accept loopback
+  connections without authentication.
+- Only a single-hop proxy is fully wired; the multi-hop chain interface exists in
+  `lib/core/dispatcher.js` but only the first hop is handed to undici.
+
+---
+
+## Uninstall
+
+```bash
+dsh plugin --profile <your-profile> remove dsh-model-proxy
+dsh --profile <your-profile>
+```
+
+After removal DSH is fully direct again — no configuration residue, no listening port.
+
+## License
+
+MIT

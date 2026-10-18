@@ -1,0 +1,5 @@
+# dsh-model-proxy 的 Profile 层注册行。
+# 代理映射全部放在插件自身的设置命名空间（model-proxy）里，这里不带任何配置。
+- insert:
+    - id: model-proxy
+      name: 'dsh-model-proxy'
