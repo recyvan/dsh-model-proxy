@@ -24,7 +24,8 @@
     "lib",
     "cordis.patch.yml",
     "config.example.json",
-    "README.md"
+    "README.md",
+    "README_zh.md"
   ],
   "sideEffects": false,
   "scripts": {

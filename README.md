@@ -1,5 +1,7 @@
 # dsh-model-proxy
 
+English | [中文](README_zh.md)
+
 Route DeepSeek Harness **model API requests** through a proxy so third-party overseas
 model providers work from mainland China, while **every other request stays direct**
 — web search, page fetching, MCP servers and tool calls never touch the proxy.
@@ -18,18 +20,6 @@ dsh plugin --profile <your-profile> add github:recyvan/dsh-model-proxy
 ```
 
 Restart DSH afterwards — the host half loads inside the harness process.
-
-### Conflict with `dsh-http-proxy`
-
-**Both plugins wrap `globalThis.fetch`, so install only one of them.**
-
-```bash
-dsh plugin --profile <your-profile> remove dsh-http-proxy
-```
-
-Two wrappers each keep their own "original fetch", so the one installed second wraps the
-first, and uninstalling in the wrong order restores an inconsistent chain. This plugin is a
-superset (system proxy, global mode, forced-direct ranges, plaintext gate, status page).
 
 ---
 
