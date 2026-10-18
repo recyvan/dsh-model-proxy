@@ -36,11 +36,15 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "platform": "web"
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/schemastery": ">=3.18.0-0 <4.0.0"
+    "@deepseek-ai/schemastery": ">=3.18.0-0 <4.0.0",
+    "@deepseek-ai/dsh-client-ui-settings": ">=0.1.5-0 <0.2.0"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.2",
