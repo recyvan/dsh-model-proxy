@@ -1,29 +1,48 @@
 /**
  * 测试总入口：`npm test`（等价于 `node test/run-all.mjs`）
  *
- * 七组用例：
+ * 分两段跑。
+ *
+ * 第一段，纯逻辑七组（不依赖写坏的配置就能跳过）：
  * 1. 匹配器 —— 域名/后缀/IP/CIDR/脱敏/代理 URL/系统代理字符串，纯函数零网络
  * 2. 规则引擎 —— 优先级、强制直连不可覆盖、明文闸门、explain
  * 3. 预设 + 配置归一化 —— 安全默认只增不减
  * 4. Windows 系统代理 —— 注入假的 reg.exe 输出，不真读注册表
- * 5. 真实代理链路 —— 本地起 HTTP 代理桩 + 目标服务器，验证 CONNECT 隧道真的被使用
+ * 5. 真实代理链路 —— 本地起 HTTP 代理桩 + 目标服务器，验证 CONNECT/绝对形式真的走了代理
  * 6. 出口解析 —— 纯函数，不建连接
  * 7. 安全断言 —— 源码里不存在读取 API Key / 改全局 dispatcher / 改环境变量的写法
  *
- * undici 由 DSH 宿主提供。本机没 `npm install` 时会自动去 DSH profile 的
- * node_modules 里找（见 test/resolve-host-deps.mjs）；实在找不到就跳过第 5、6 组。
+ * 第二段，入口文件冒烟（历史上真正坏过两次的地方）：
+ * 8. host-smoke —— 用真 schemastery + 活引用配置跑 `lib/index.js`：
+ *    apply、诊断路由、`loader/volatile-update` 热更新、写入校验、卸载恢复
+ * 9. client-smoke —— 打桩 `__ModuleLoader__`/React 跑 `lib/client.js`：
+ *    inject 不含 settingsScope、注册到 settings.section、组件可渲染
+ *
+ * undici 与 schemastery 都由 DSH 宿主提供。本机没 `npm install` 时会自动去 DSH profile 的
+ * node_modules 里找（见 test/resolve-host-deps.mjs）；找不到就跳过依赖它的组，其余照常跑。
  */
 
 import { connect as netConnect } from 'node:net';
 import { createServer, request } from 'node:http';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import * as h from './harness.mjs';
-import { importPackage } from './resolve-host-deps.mjs';
+import { importPackage, resolvePackageDir, resolveSchemasteryDir } from './resolve-host-deps.mjs';
+
+const projectRoot = fileURLToPath(new URL('..', import.meta.url));
 
 const { suite, ok, eq, deepEq, includes, notIncludes, rejects } = h;
+
+// 本机同时装着 DSH 桌面版和它的开发依赖树；让解析顺序稳定指向桌面版 profile
+// （用户实际在跑的那份），除非调用方显式指定了 DSH_HOME。
+if (!process.env.DSH_HOME) {
+	const devRoot = join(process.cwd(), '..', '..');
+	if (existsSync(join(devRoot, 'dsh-home', 'profiles', 'desktop'))) {
+		process.env.DSH_HOME = join(devRoot, 'dsh-home');
+	}
+}
 
 // ── undici：本地 → DSH profile（都找不到就跳过相关两组） ──
 const undiciModule = await importPackage('undici', 'index.js');
@@ -398,18 +417,48 @@ suite('system-proxy', async (test) => {
 // ═══════════════════════════════════════════════════════════
 
 /**
- * 极简正向代理：**只支持 CONNECT**。
+ * 极简正向代理：CONNECT 隧道 + 绝对形式请求转发。
  *
- * undici 的 `ProxyAgent` 对 http 目标同样走 CONNECT 隧道（不是绝对形式请求行），
- * 所以桩必须实现 CONNECT 转发，否则请求会挂起。记录 CONNECT 次数用来断言
- * 「请求真的经过了代理」。
+ * undici 的 `ProxyAgent` 对不同目标形态会走不同路径：
+ * - https 目标 → CONNECT 隧道（`server.on('connect')`）
+ * - http 目标 → 绝对形式请求行（`GET http://host:port/path HTTP/1.1`），
+ *   桩必须自己再发一次请求转发过去，否则用例只会拿到 405。
+ *
+ * `state.connects` 记 CONNECT 次数，`state.absolute` 记绝对形式请求次数，
+ * 两者都能用来断言「请求真的经过了代理」。
  */
 function startProxyStub() {
-	const state = { connects: 0, tunnelled: 0 };
+	const state = { connects: 0, tunnelled: 0, absolute: 0 };
 	const server = createServer((req, res) => {
-		// 真实流量不会以明文绝对形式到达这里；保留一个明确的 405 便于排查
-		res.writeHead(405, { 'content-type': 'text/plain' });
-		res.end('this stub only supports CONNECT');
+		state.absolute += 1;
+		let target;
+		try {
+			target = new URL(String(req.url));
+		} catch {
+			res.writeHead(400, { 'content-type': 'text/plain' });
+			res.end('proxy stub: request line is not an absolute URL');
+			return;
+		}
+		const forwarded = request(
+			{
+				protocol: target.protocol,
+				hostname: target.hostname,
+				port: target.port,
+				method: req.method,
+				path: `${target.pathname}${target.search}`,
+				headers: { ...req.headers, host: target.host },
+			},
+			(upstream) => {
+				res.writeHead(upstream.statusCode ?? 502, upstream.headers);
+				upstream.pipe(res);
+			},
+		);
+		forwarded.on('error', (error) => {
+			if (res.writableEnded) return;
+			res.writeHead(502, { 'content-type': 'text/plain' });
+			res.end(`proxy stub: ${error.message}`);
+		});
+		req.pipe(forwarded);
 	});
 	server.on('connect', (req, socket, head) => {
 		state.connects += 1;
@@ -447,13 +496,18 @@ if (hasUndici) {
 			const resolved = dispatcher.resolveExit({ kind: 'proxy', id: 'p1', proxy: cfg.proxies[0] }, { config: cfg, env: {} });
 			ok(resolved.ok);
 			const entry = await dispatcher.createDispatcher(resolved.uris);
-			const before = proxyStub.state.connects;
+			const beforeConnects = proxyStub.state.connects;
+			const beforeAbsolute = proxyStub.state.absolute;
 			const response = await undiciModule.fetch(targetUrl, { dispatcher: entry.dispatcher });
 			const body = await response.json();
 			eq(response.status, 200);
-			// 响应体来自目标服务器 → 说明代理真的把隧道接通了，而不是假的 200
+			// 响应体来自目标服务器 → 说明代理真的把请求转发了，而不是假的 200
 			eq(body.via, 'target');
-			ok(proxyStub.state.connects > before, 'proxy stub should receive a CONNECT');
+			// http 目标走绝对形式请求行；https 目标走 CONNECT。两种都算「经过了代理」。
+			ok(
+				proxyStub.state.connects > beforeConnects || proxyStub.state.absolute > beforeAbsolute,
+				'proxy stub should receive the request (CONNECT or absolute form)',
+			);
 			await entry.close();
 		});
 
@@ -649,6 +703,235 @@ suite('security', async (test) => {
 
 // ── 辅助 ────────────────────────────────────────────────────
 
+/**
+ * 监听一段代码里发生的 uncaughtException / unhandledRejection。
+ * `apply()` 会换掉 `globalThis.fetch`，被测用例里的异步残留可能把事件漏出来；
+ * 只收集「带插件命名空间前缀」的那些，避免把无关噪声算到用例头上。
+ */
+function captureProcessErrors() {	const caught = [];
+	const onCaught = (error) => caught.push(error);
+	process.on('uncaughtException', onCaught);
+	process.on('unhandledRejection', onCaught);
+	return {
+		list: () => caught,
+		stop: () => {
+			process.off('uncaughtException', onCaught);
+			process.off('unhandledRejection', onCaught);
+		},
+	};
+}
+
+// ── 冒烟部分：入口文件（需要 schemastery 与一个假的客户端宿主） ──
+/** 宿主是否提供带 `volatile()` 的 schemastery（DSH 0.2.x 的入口文件依赖它）。 */
+const needsSchemastery = resolveSchemasteryDir() !== undefined;
+const schemasteryAvailable = needsSchemastery;
+if (!schemasteryAvailable) {
+	console.log(
+		'\n⚠ 未解析到带 volatile() 的 @deepseek-ai/schemastery（需要 3.18.5+）：跳过「入口文件冒烟」两组用例。' +
+			'\n  设置 DSH_HOME 指向 DSH 数据目录，或在插件目录 npm install 后重跑。\n',
+	);
+}
+
+/**
+ * `lib/index.js`（宿主一半）与 `lib/client.js`（客户端一半）才是历史上真正坏过两次的
+ * 地方：`settingsScope` 挂死启动、peer 范围导致拒装。这里用最小假宿主把它们跑起来。
+ *
+ * harness 是「先注册、全部跑完后统一 run()」，所以套件里要用的真实模块由 `use()`
+ * 在现场（run 之前）拉进来——模块加载只做一次，也不会因为顶层 await 时序错乱。
+ */
+function registerSmokeSuites(use) {
+	if (!schemasteryAvailable) return;
+
+	suite('host-smoke', async (test) => {
+		const host = await use();
+		const originalFetch = globalThis.fetch;
+		const disposers = [];
+		const events = new Map();
+		let routeHandler;
+		let ctx;
+
+		const live = (value) => ({ get: () => value });
+		const makeConfig = (mode) => ({
+			mode: live(mode),
+			defaultAction: live('direct'),
+			proxy: live(''),
+			proxyUri: live('socks5h://127.0.0.1:7890'),
+			proxyType: live('socks5h'),
+			proxyHost: live(''),
+			proxyPort: live(0),
+			proxyUser: live(''),
+			proxyPassword: live(''),
+			proxyHosts: live([]),
+			excludeHosts: live([]),
+			allowInsecureUpstream: live(false),
+			extendToTools: live(false),
+			logLevel: live('info'),
+		});
+		const makeCtx = () => {
+			const instance = {
+				logger: { info() {}, warn() {}, debug() {}, error() {} },
+				effect(fn) {
+					const dispose = fn();
+					if (typeof dispose === 'function') disposers.push(dispose);
+					return () => {};
+				},
+				on(event, cb) {
+					events.set(event, cb);
+					return () => events.delete(event);
+				},
+				inject(services, cb) {
+					cb(instance);
+					return { dispose() {} };
+				},
+				webServer: {
+					register(spec) {
+						routeHandler = spec.handler;
+						return () => {};
+					},
+				},
+			};
+			return instance;
+		};
+		const readStatus = async () => {
+			const text = await new Promise((resolve) => {
+				const res = { writeHead() {}, end(body) { resolve(body); } };
+				routeHandler({ method: 'GET', url: `${host.index.ROUTE_PATH}/status`, headers: { host: '127.0.0.1:3269' } }, res);
+			});
+			return JSON.parse(text);
+		};
+
+		test('Config schema 覆盖设置页字段，且不再有与 mode:off 重复的 enabled', () => {
+			const keys = new Set(Object.keys(host.index.Config.dict ?? {}));
+			for (const key of ['mode', 'proxyType', 'proxyUri', 'proxyHosts', 'excludeHosts', 'allowInsecureUpstream', 'logLevel']) {
+				ok(keys.has(key), `Config 缺少字段 ${key}`);
+			}
+			ok(!keys.has('enabled'), 'enabled 已并入 mode:off，不应再出现在 Config 里');
+		});
+
+		test('readSettings 能解活引用，也能吃普通值', () => {
+			const flat = host.index.readSettings(makeConfig('custom'));
+			eq(flat.mode, 'custom');
+			eq(flat.proxyUri, 'socks5h://127.0.0.1:7890');
+			eq(flat.logLevel, 'info');
+			eq(host.index.readSettings({ mode: 'off' }).mode, 'off');
+			eq(host.index.readSettings(undefined).mode, 'rule');
+		});
+
+		test('assertValid 仍然拦得住写坏的组合（写入校验没丢）', async () => {
+			// mode=custom 却没填地址
+			await rejects(() => host.index.assertValid({ mode: 'custom' }), 'mode=custom 缺地址应被拒');
+			// 不支持的代理协议
+			await rejects(() => host.index.assertValid({ mode: 'custom', proxyUri: 'ftp://127.0.0.1:21' }), '不支持的协议应被拒');
+			// 裸 host:port 而没选协议 → 会被当成 scheme=127.0.0.1 的 URL，必须在写入时就拒掉
+			await rejects(() => host.index.assertValid({ mode: 'custom', proxyUri: '127.0.0.1:7890' }), '裸地址缺协议应被拒');
+			// 合法组合照常通过：`127.0.0.1:7890` 本来就是设置页推荐的写法，
+			// 前端保存时会补全协议；这里显式给出 proxyType，等价于「用户选了协议」。
+			ok(host.index.assertValid({ mode: 'custom', proxyType: 'socks5h', proxyUri: 'socks5h://127.0.0.1:7890' }));
+			ok(host.index.assertValid({ mode: 'custom', proxyUri: 'socks5h://127.0.0.1:7890' }));
+		});
+
+		test('apply 接管 globalThis.fetch，诊断路由返回快照', async () => {
+			ctx = makeCtx();
+			host.index.apply(ctx, makeConfig('custom'));
+			ok(globalThis.fetch !== originalFetch, 'apply 后 globalThis.fetch 应被包装');
+			eq(typeof routeHandler, 'function', 'webServer.register 应被调用');
+			const snapshot = await readStatus();
+			eq(snapshot.ok, true);
+			eq(snapshot.status.mode, 'custom');
+			eq(snapshot.status.active, true);
+			eq(snapshot.status.exitId, 'custom');
+		});
+
+		test('设置提交（loader/volatile-update）后重新编译；不相关路径不打断', async () => {
+			eq(typeof events.get('loader/volatile-update'), 'function', '应订阅 loader/volatile-update');
+			const offConfig = makeConfig('off');
+			ctx = makeCtx();
+			host.index.apply(ctx, offConfig);
+			const after = await readStatus();
+			eq(after.status.mode, 'off', '提交 mode=off 后应重新编译');
+			eq(after.status.active, false, 'mode=off 时应停用代理');
+			// 别的插件的字段变动不影响我们
+			events.get('loader/volatile-update')([['someOtherPlugin', 'field']]);
+			eq((await readStatus()).status.mode, 'off', '不相关路径的更新不应改变状态');
+		});
+
+		test('写坏的值不会顶掉正在工作的配置', async () => {
+			const badConfig = makeConfig('custom');
+			badConfig.proxyUri = { get: () => '' };
+			ctx = makeCtx();
+			host.index.apply(ctx, badConfig);
+			const snapshot = await readStatus();
+			ok(snapshot.status.lastError, '写坏时应记录 lastError');
+			eq(snapshot.status.lastSelfCheck.ok, false);
+		});
+
+		test('卸载后恢复原 fetch', async () => {
+			while (disposers.length > 0) {
+				const dispose = disposers.pop();
+				try {
+					dispose();
+				} catch {
+					/* 卸载失败由下一行断言暴露 */
+				}
+			}
+			globalThis.fetch = originalFetch;
+			eq(globalThis.fetch, originalFetch, 'dispose 后应恢复原 fetch');
+		});
+	});
+
+	suite('client-smoke', async (test) => {
+		const client = await use();
+		const module = client.clientModule;
+		let registered;
+		let slotName;
+
+		test('inject 里没有 settingsScope，只有 slots/remote/remote.settings', () => {
+			deepEq(module.inject, ['slots', 'remote', 'remote.settings']);
+			ok(!module.inject.includes('settingsScope'), 'inject 不得包含 settingsScope');
+		});
+
+		test('挂载到 settings.section，id = model-proxy', () => {
+			const ctx = {
+				effect(fn) {
+					fn();
+				},
+				slots: {
+					inject(name, cb) {
+						slotName = name;
+						cb();
+						return () => {};
+					},
+					register(spec, component) {
+						registered = { spec, component };
+						return () => {};
+					},
+				},
+				remote: {
+					settings: {
+						describe: async () => ({ ok: true, value: { writable: true, namespaces: [] } }),
+						mutate: async () => ({ ok: true, value: {} }),
+					},
+					$on: () => () => {},
+				},
+			};
+			module.apply(ctx);
+			eq(slotName, 'settings.section');
+			eq(registered.spec.name, 'settings.section');
+			eq(registered.spec.id, 'model-proxy');
+			eq(typeof registered.spec.label, 'function');
+			eq(registered.spec.label(), '模型代理');
+		});
+
+		test('组件可渲染，且包含核心字段', () => {
+			const wrapper = registered.component({});
+			const tree = wrapper.type(wrapper.props);
+			eq(tree.type, 'div');
+			const text = JSON.stringify(tree);
+			for (const needle of ['模型代理', '模式', '日志级别', '保存']) includes(text, needle);
+		});
+	});
+}
+
 function collectJsFiles(root) {
 	const files = [];
 	const walk = (dir) => {
@@ -669,6 +952,77 @@ function stripComments(text) {
 
 // ═══════════════════════════════════════════════════════════
 
+/**
+ * 把两个入口文件加载进来，供冒烟套件使用。
+ * - 宿主一半：真 schemastery（从 DSH profile 里解析到的那份）
+ * - 客户端一半：`lib/client.js` 是给浏览器壳用的 IIFE，这里用假的 `window.__ModuleLoader__`
+ *   截获它，再用打桩的 `react` 跑 `factory`
+ * @returns {Promise<{index:any, clientModule:any}>}
+ */
+async function loadEntries() {
+	// `lib/index.js` 里 `import z from '@deepseek-ai/schemastery'` 是裸说明符。
+	// 插件刻意不把 schemastery 装成自己的 dependency（用宿主那份，版本才跟得上
+	// `volatile()` 这类新 API），所以测试期间在插件目录造一个临时链接，跑完即删。
+	// 指向的必须是「带 volatile() 的宿主副本」——本机同时存在 3.18.2（没有）和
+	// 3.18.5（有），链错版本会得到和真宿主不同的结论。
+	const schemasteryDir = resolveSchemasteryDir();
+	const linkParent = join(projectRoot, 'node_modules');
+	const link = join(linkParent, '@deepseek-ai', 'schemastery');
+	const created = [];
+	if (schemasteryDir !== undefined && !existsSync(link)) {
+		try {
+			mkdirSync(join(linkParent, '@deepseek-ai'), { recursive: true });
+			created.push(join(linkParent, '@deepseek-ai'), linkParent);
+			symlinkSync(schemasteryDir, link, 'junction');
+		} catch (error) {
+			console.log(`\n⚠ 无法在测试期链接宿主 schemastery（${error?.message ?? error}），入口冒烟用例跳过。\n`);
+			return {};
+		}
+	}
+
+	let index;
+	try {
+		index = await import('../lib/index.js');
+	} finally {
+		try {
+			rmSync(link, { recursive: true, force: true });
+			for (const dir of created) {
+				if (existsSync(dir) && readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true });
+			}
+		} catch {
+			/* 清理失败不影响测试结论 */
+		}
+	}
+
+	const captured = [];
+	const previousWindow = globalThis.window;
+	globalThis.window = { __ModuleLoader__: { load: (spec) => captured.push(spec) } };
+	try {
+		await import('../lib/client.js');
+	} finally {
+		if (previousWindow === undefined) delete globalThis.window;
+		else globalThis.window = previousWindow;
+	}
+	const spec = captured[0];
+	if (spec === undefined) throw new Error('lib/client.js 没有调用 window.__ModuleLoader__.load');
+
+	const element = (type, props, ...children) => ({ type, props, children });
+	const reactStub = {
+		createElement: element,
+		useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+		useEffect: () => {},
+		useCallback: (fn) => fn,
+		useMemo: (fn) => fn(),
+		useRef: (value) => ({ current: value }),
+	};
+	const requireStub = (name) => {
+		if (name === 'react') return reactStub;
+		throw new Error(`unexpected require: ${name}`);
+	};
+	return { index, clientModule: spec.factory(requireStub) };
+}
+
+const smokeRun = {};
 const result = await h.run();
 await h.runCleanups();
 console.log('');
@@ -678,4 +1032,35 @@ if (result.failed > 0) {
 	process.exitCode = 1;
 } else {
 	console.log(`all ${result.passed} tests passed`);
+}
+
+// ── 冒烟部分：入口文件（需要 schemastery 与一个打桩的客户端宿主） ──
+if (needsSchemastery) {
+	const smoke = captureProcessErrors();
+	try {
+		Object.assign(smokeRun, await loadEntries());
+		registerSmokeSuites(async () => smokeRun);
+	} catch (error) {
+		smoke.stop();
+		console.log(`\n✗ 无法加载入口文件：${error?.stack ?? error}`);
+		process.exitCode = 1;
+		throw error;
+	}
+	const smokeResult = await h.run();
+	await h.runCleanups();
+	smoke.stop();
+	const leaked = smoke.list().filter((error) => String(error?.message ?? error).includes('model-proxy'));
+	if (leaked.length > 0) {
+		console.log(`\n✗ 卸载后有 ${leaked.length} 个与插件相关的异步错误逃逸（应为 0）`);
+		for (const error of leaked) console.log(String(error?.stack ?? error));
+		process.exitCode = 1;
+	}
+	console.log('');
+	if (smokeResult.failed > 0) {
+		console.log(`${smokeResult.passed} passed, ${smokeResult.failed} FAILED`);
+		for (const failure of smokeResult.failures) console.log(`\n--- ${failure.suite} :: ${failure.test}\n${failure.error}`);
+		process.exitCode = 1;
+	} else {
+		console.log(`all ${smokeResult.passed} smoke tests passed`);
+	}
 }

@@ -1,11 +1,11 @@
 {
-  "//": "Reference only — the live configuration lives in the DSH settings namespace `model-proxy` (Settings → Plugin configuration). Fields map one-to-one to the settings card.",
+  "//": "Reference only: the live configuration lives in the DSH settings namespace `model-proxy` (Settings → Model Proxy). Every key below maps one-to-one to a field on that page; this file is never read at runtime.",
   "mode": "rule",
   "proxyType": "socks5h",
-  "proxyUri": "127.0.0.1:7890",
+  "proxyUri": "socks5h://127.0.0.1:7890",
   "proxyHosts": [],
   "excludeHosts": [],
   "allowInsecureUpstream": false,
-  "logLevel": "info",
-  "enabled": true
+  "extendToTools": false,
+  "logLevel": "info"
 }

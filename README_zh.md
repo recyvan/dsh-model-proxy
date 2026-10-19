@@ -57,17 +57,19 @@ DeepSeek、DashScope、智谱、Kimi 等国内服务保持直连。
 ### 国内访问海外 API 的注意事项
 
 - **DNS 污染**：优先用 `socks5h`（由代理解析 DNS），或让你的代理客户端接管 DNS。
-- **明文 `http` 默认被拒绝**——API Key 不应该以明文穿过代理。确实需要时，在设置卡片里勾选对应选项。
+- **明文 `http` 默认被拒绝**——API Key 不应该以明文穿过代理。确实需要时，在设置页里勾选对应选项。
 - 代理必须监听回环地址；请在代理客户端里打开本地/局域网监听。
 
 ---
 
 ## 验证
 
-1. 设置卡片显示实时状态：`path A · exit route · N rules · proxied x / direct y`。
+1. 设置页显示实时状态：`path A · exit route · N rules · proxied x / direct y`。
 2. `http://127.0.0.1:<port>/dsh-model-proxy/status` 返回同一份快照的 JSON
    （仅限回环 / 同源访问）。
-3. `node test/run-all.mjs`——测试套件零依赖。
+3. 在源码仓库里跑 `npm test`（等价于 `node test/run-all.mjs`）。测试套件随仓库发布、
+   不在 npm 包里，也不需要安装依赖——它会从你的 DSH profile（或 `DSH_HOME`）里取宿主自己的
+   `undici` 与 `@deepseek-ai/schemastery`。
 
 ---
 
@@ -79,7 +81,7 @@ DeepSeek、DashScope、智谱、Kimi 等国内服务保持直连。
    `169.254/16`、`fc00::/7` 等）、`localhost` 以及 `.local`/`.lan`/`.internal` 这类名字
    永远不会走代理。用户规则可以新增条目，但不能删掉这些。
 2. **明文闸门**——非 `https` 的模型请求在打开任何 socket 之前就被拒绝，除非显式开启该选项
-   （此时卡片会持续显示警告）。
+   （此时设置页会持续显示警告）。
 3. **数据最小化**——插件以流的方式透传请求和响应体；从不解析它们、从不写入磁盘，
    也从不读取 `Authorization` 或任何厂商的 API Key。默认日志只记录出口标识和错误类别，
    不含主机名、不含路径、不含请求体。
@@ -93,12 +95,14 @@ DeepSeek、DashScope、智谱、Kimi 等国内服务保持直连。
 
 ```
 lib/index.js       Cordis 宿主入口——唯一接触 harness API 的文件
-lib/client.js      设置卡片（`__ModuleLoader__` 浏览器入口）
+lib/client.js      设置页（`__ModuleLoader__` 浏览器入口）
 lib/core/*         纯逻辑，不依赖 harness，可独立测试
-test/run-all.mjs   零依赖测试套件
+test/run-all.mjs   测试套件：先跑纯逻辑各组，再跑入口文件冒烟
 ```
 
-运行时依赖只有 `undici`；`@deepseek-ai/schemastery` 是由宿主提供的 peer。
+`undici` 与 `@deepseek-ai/schemastery` 都是 **peer**——宿主已经带了，再装一份会让进程里出现
+两个 dispatcher / `Schema` 实例。`devDependencies` 里的同名条目只是为了让 `npm test`
+能在 DSH 之外跑；测试本身优先用宿主那份。
 
 ---
 
