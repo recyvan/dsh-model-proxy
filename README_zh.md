@@ -20,11 +20,15 @@ dsh plugin --profile <你的 profile> add github:recyvan/dsh-model-proxy
 
 安装后重启 DSH——宿主部分是在 harness 进程内加载的。
 
+需要 **DSH 0.2.1-rc.2 或更新版本**。设置页由宿主按插件的 `Config` schema 生成
+（0.2.x 移除了宿主侧的 `settings` 服务和客户端的 `settingsScope` 服务），
+更老的 harness 会在安装阶段被拒绝。
+
 ---
 
 ## 配置
 
-打开 **设置 → 插件配置 → “Model Proxy”**。
+打开 **设置 → 模型代理**（设置左侧独立一页）。
 
 | 字段 | 含义 |
 | --- | --- |
