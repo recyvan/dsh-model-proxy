@@ -3,8 +3,9 @@
 English | [中文](README_zh.md)
 
 Route DeepSeek Harness **model API requests** through a proxy so third-party overseas
-model providers work from mainland China, while **every other request stays direct**
-— web search, page fetching, MCP servers and tool calls never touch the proxy.
+model providers work from mainland China, while **requests outside the domains you list stay
+direct** — web search, page fetching, MCP servers and tool calls are not proxied unless you
+add their domains.
 
 - Does not patch any harness file; uninstalling restores the original behaviour exactly
 - **System proxy**, **custom proxy** (`http` / `https` / `socks4` / `socks4a` / `socks5` / `socks5h`), or env-based
@@ -92,7 +93,8 @@ These hold regardless of configuration, and are what the rules engine checks fir
    no paths, no bodies.
 
 A failed exit falls back to **direct**, never to another exit: silently moving traffic to a
-different exit would change the outbound identity without the user noticing.
+different exit would change the outbound identity without the user noticing. The fallback is
+logged and shown on the settings page, so a degraded state is visible rather than silent.
 
 ---
 
@@ -113,9 +115,12 @@ entries exist only so `npm test` can run outside DSH; the suite itself prefers t
 
 ## Limitations
 
-- Covers model requests issued through **`fetch`**. `transport: websocket` streaming and
-  provider native-SDK channels (e.g. Amazon Bedrock) do not pass through `fetch` and cannot be
-  proxied here — use the harness's built-in environment-variable proxy for those.
+- Covers requests issued through **`fetch`** — in practice every model request, plus any
+  other `fetch` traffic whose domain you add to the proxy list. `transport: websocket` streaming
+  and provider native-SDK channels (e.g. Amazon Bedrock) do not pass through `fetch` and cannot be
+  proxied here — use the harness's built-in environment-variable proxy for those. Web page
+  fetching is in the same category: the harness's fetch tool builds its own `undici` agent, so
+  domain rules never see it.
 - Routing is by **domain**. A domain that serves both a model API and other traffic sends all
   of it through the proxy; list such domains under "Exclude domains".
 - Proxy credentials can only be embedded in the proxy address (`http://user:pass@host:port`),

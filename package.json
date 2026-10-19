@@ -1,11 +1,21 @@
 {
   "name": "dsh-model-proxy",
   "version": "0.2.0",
-  "description": "Route DeepSeek Harness model API requests through a system, custom, or SOCKS proxy while every other request stays direct.",
+  "description": "Route DeepSeek Harness model API requests through a system, custom, or SOCKS proxy; requests outside the configured domains stay direct.",
   "type": "module",
   "license": "MIT",
   "author": "dsh-model-proxy contributors",
-  "keywords": ["deepseek", "harness", "dsh", "dsh-plugin", "proxy", "socks", "cordis", "openai", "anthropic"],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "proxy",
+    "socks",
+    "cordis",
+    "openai",
+    "anthropic"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/recyvan/dsh-model-proxy.git"
@@ -16,8 +26,12 @@
   },
   "main": "./lib/index.js",
   "exports": {
-    ".": { "default": "./lib/index.js" },
-    "./client": { "default": "./lib/client.js" },
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -52,9 +66,15 @@
     "undici": ">=6.0.0 <8.0.0"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/dsh": { "optional": true },
-    "@deepseek-ai/schemastery": { "optional": true },
-    "undici": { "optional": true }
+    "@deepseek-ai/dsh": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "undici": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@deepseek-ai/schemastery": "^3.18.5",
