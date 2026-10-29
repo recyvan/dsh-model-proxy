@@ -425,10 +425,11 @@ suite('system-proxy', async (test) => {
  *   桩必须自己再发一次请求转发过去，否则用例只会拿到 405。
  *
  * `state.connects` 记 CONNECT 次数，`state.absolute` 记绝对形式请求次数，
- * 两者都能用来断言「请求真的经过了代理」。
+ * 两者都能用来断言「请求真的经过了代理」；`state.connectTargets` 记每一条
+ * CONNECT 的目标（`host:port` 字符串），链式用例据此判断每一跳拨向了谁。
  */
-function startProxyStub() {
-	const state = { connects: 0, tunnelled: 0, absolute: 0 };
+function startProxyStub(label = 'stub') {
+	const state = { label, connects: 0, tunnelled: 0, absolute: 0, connectTargets: [] };
 	const server = createServer((req, res) => {
 		state.absolute += 1;
 		let target;
@@ -462,8 +463,18 @@ function startProxyStub() {
 	});
 	server.on('connect', (req, socket, head) => {
 		state.connects += 1;
-		const [host, port] = String(req.url).split(':');
-		const upstream = netConnect(Number(port), host, () => {
+		state.connectTargets.push(String(req.url));
+		// CONNECT 目标可能是 `host:port` 或 `[ipv6]:port`；解析不出端口时
+		// 明确返回 400，而不是把 NaN 丢给 net.connect（会抛 ERR_SOCKET_BAD_PORT，
+		// 让整个测试进程挂掉、看不出是哪条用例）。
+		const match = /^\[?([^\]]+?)\]?:(\d+)$/.exec(String(req.url));
+		const port = match === null ? Number.NaN : Number(match[2]);
+		const host = match === null ? '' : match[1];
+		if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+			socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+			return;
+		}
+		const upstream = netConnect(port, host, () => {
 			state.tunnelled += 1;
 			socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
 			if (head.length > 0) upstream.write(head);
@@ -584,6 +595,105 @@ if (hasUndici) {
 		h.cleanup(() => {
 			proxyStub.server.close();
 			target.server.close();
+		});
+	});
+}
+
+// ═══════════════════════════════════════════════════════════
+// 5b. 代理链：每一跳真的拨向了下一跳
+// ═══════════════════════════════════════════════════════════
+
+if (hasUndici) {
+	suite('chain', async (test) => {
+		const makeTarget = () =>
+			new Promise((resolve) => {
+				const server = createServer((req, res) => {
+					res.writeHead(200, { 'content-type': 'application/json' });
+					res.end(JSON.stringify({ via: 'target' }));
+				});
+				server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+			});
+
+		/**
+		 * 起 N 个 CONNECT 桩 + 一个目标，按 `uris` 顺序折叠出 dispatcher，
+		 * 断言每一跳实际拨向的端口都与期望一致。
+		 * 这是「chainLength 不说谎」的唯一证据：只看最终 200 无法区分
+		 * `h1->h2->h3->target` 与方向相反的 `h3->h2->h1->target`。
+		 */
+		const runChain = async (depth) => {
+			const hops = [];
+			for (let i = 0; i < depth; i += 1) hops.push(await startProxyStub(`h${i + 1}`));
+			const target = await makeTarget();
+			const uris = hops.map((hop) => `http://127.0.0.1:${hop.port}`);
+			const entry = await dispatcher.createDispatcher(uris);
+			try {
+				const response = await undiciModule.fetch(`http://127.0.0.1:${target.port}/x`, { dispatcher: entry.dispatcher });
+				const body = await response.json();
+				eq(response.status, 200);
+				eq(body.via, 'target', '响应必须来自目标服务器');
+				eq(entry.chainLength, depth, `chainLength 必须等于真实跳数 ${depth}`);
+				// 第 i 跳应当拨向第 i+1 跳；最后一跳拨向目标
+				for (let i = 0; i < depth; i += 1) {
+					const expectedPort = i + 1 < depth ? hops[i + 1].port : target.port;
+					const actual = hops[i].state.connectTargets[0];
+					eq(actual, `127.0.0.1:${expectedPort}`, `第 ${i + 1} 跳应拨向 ${expectedPort}，实际 ${actual}`);
+				}
+				// 没有哪一跳被跳过
+				for (const hop of hops) ok(hop.state.connects > 0, `${hop.state.label} 应当收到过 CONNECT`);
+			} finally {
+				await entry.close();
+				for (const hop of hops) hop.server.close();
+				target.server.close();
+			}
+		};
+
+		test('两跳：h1 -> h2 -> target，顺序与配置一致', async () => {
+			await runChain(2);
+		});
+
+		test('三跳：h1 -> h2 -> h3 -> target，中间跳不被跳过', async () => {
+			await runChain(3);
+		});
+
+		test('折叠方向反了会掉换出口身份（回归护栏）', async () => {
+			// 这条用例证明上面的正序断言不是「怎么折都能过」：反向折叠时，
+			// 内层（配置里的第一跳）收到的是**绝对形式请求行**（`http://host:port/path`），
+			// 根本没有 CONNECT —— 也就是说第二跳被架空，隧道压根没建。
+			// 正序实现的同一场景下，第一跳收到的必然是 `127.0.0.1:<第二跳端口>`。
+			const h1 = await startProxyStub('h1');
+			const h2 = await startProxyStub('h2');
+			const target = await makeTarget();
+			const inner = new undiciModule.ProxyAgent({ uri: `http://127.0.0.1:${h1.port}` });
+			const outer = new undiciModule.ProxyAgent({
+				uri: `http://127.0.0.1:${h2.port}`,
+				clientFactory: () => inner,
+				proxyTunnel: true,
+			});
+			try {
+				await undiciModule
+					.fetch(`https://127.0.0.1:${target.port}/x`, { dispatcher: outer })
+					.catch(() => {});
+				// 反向折叠：h1 收到的不是 CONNECT 到 h2，而是绝对形式请求（直接对目标）。
+				ok(
+					h1.state.connectTargets[0] !== `127.0.0.1:${h2.port}`,
+					'反向折叠时 h1 不应拨向 h2——这正是正序实现与反向实现的差别',
+				);
+				ok(h1.state.absolute > 0 || h1.state.connectTargets[0]?.startsWith('http'), '反向折叠时 h1 收到的是绝对形式请求行');
+			} finally {
+				// 只关最外层：外层 close 会顺着 clientFactory 把内层一并关掉
+				await outer.close().catch(() => {});
+				h1.server.close();
+				h2.server.close();
+				target.server.close();
+			}
+		});
+
+		test('单跳的 chainLength 是 1', async () => {
+			const hop = await startProxyStub();
+			const entry = await dispatcher.createDispatcher([`http://127.0.0.1:${hop.port}`]);
+			eq(entry.chainLength, 1);
+			await entry.close();
+			hop.server.close();
 		});
 	});
 }
@@ -865,7 +975,15 @@ function registerSmokeSuites(use) {
 			eq(snapshot.status.lastSelfCheck.ok, false);
 		});
 
-		test('卸载后恢复原 fetch', async () => {
+		test('卸载时若 fetch 已被别人包装，不抹掉别人的包装', async () => {
+			ctx = makeCtx();
+			host.index.apply(ctx, makeConfig('rule'));
+			const ours = globalThis.fetch;
+			ok(ours !== originalFetch, 'apply 后应装上我们的包装');
+			// 模拟「别的插件在我们之后又包了一层」
+			const foreign = async (...args) => ours(...args);
+			globalThis.fetch = foreign;
+			// 触发卸载
 			while (disposers.length > 0) {
 				const dispose = disposers.pop();
 				try {
@@ -874,8 +992,91 @@ function registerSmokeSuites(use) {
 					/* 卸载失败由下一行断言暴露 */
 				}
 			}
+			eq(globalThis.fetch, foreign, '栈顶是别人的包装时必须原样保留，不能回写成原 fetch');
 			globalThis.fetch = originalFetch;
-			eq(globalThis.fetch, originalFetch, 'dispose 后应恢复原 fetch');
+		});
+
+		test('POST /probe 未启用时明确回报，不发网络请求', async () => {
+			ctx = makeCtx();
+			host.index.apply(ctx, makeConfig('off'));
+			const body = await new Promise((resolve) => {
+				const res = { writeHead() {}, end(text) { resolve(text); } };
+				routeHandler(
+					{ method: 'POST', url: `${host.index.ROUTE_PATH}/probe`, headers: { host: '127.0.0.1:3269' } },
+					res,
+				);
+			});
+			const result = JSON.parse(body);
+			eq(result.ok, false);
+			eq(result.error, 'inactive');
+			ok(typeof result.failure === 'string' && result.failure.length > 0);
+		});
+
+		test('GET /probe 被拒绝（探针会发请求，只能 POST 触发）', async () => {
+			const sent = await new Promise((resolve) => {
+				let code;
+				const res = { writeHead(c) { code = c; }, end(text) { resolve({ code, text }); } };
+				routeHandler(
+					{ method: 'GET', url: `${host.index.ROUTE_PATH}/probe`, headers: { host: '127.0.0.1:3269' } },
+					res,
+				);
+			});
+			eq(sent.code, 405);
+			eq(JSON.parse(sent.text).ok, false);
+		});
+
+		test('探针不回报主机名与响应体', async () => {
+			ctx = makeCtx();
+			host.index.apply(ctx, makeConfig('custom'));
+			const body = await new Promise((resolve) => {
+				const res = { writeHead() {}, end(text) { resolve(text); } };
+				routeHandler(
+					{ method: 'POST', url: `${host.index.ROUTE_PATH}/probe`, headers: { host: '127.0.0.1:3269' } },
+					res,
+				);
+			});
+			const result = JSON.parse(body);
+			// 无论成败，返回里都不该出现目标主机名或路径
+			notIncludes(body, 'api.deepseek.com');
+			ok('ms' in result, '必须回报耗时');
+			ok('ok' in result, '必须回报成败');
+		});
+	});
+
+	suite('i18n', async (test) => {
+		const client = await use();
+
+		test('中英文字典的 key 集合完全一致（漏翻会在这里失败）', () => {
+			const zh = Object.keys(client.messages.zh).sort();
+			const en = Object.keys(client.messages.en).sort();
+			deepEq(en, zh, 'en 与 zh 的 key 必须一一对应');
+			ok(zh.length > 0);
+		});
+
+		test('没有空译文', () => {
+			for (const lang of ['zh', 'en']) {
+				for (const [key, value] of Object.entries(client.messages[lang])) {
+					ok(typeof value === 'string' && value.trim() !== '', `${lang}.${key} 是空的`);
+				}
+			}
+		});
+
+		test('client.js 内联的字典与 lib/i18n.js 完全一致', () => {
+			// 客户端是 IIFE，只能内联一份副本；这里防止两份漂移。
+			const source = readFileSync(join(projectRoot, 'lib/client.js'), 'utf8');
+			for (const [key, value] of Object.entries(client.messages.zh)) {
+				ok(source.includes(value), `client.js 缺少 zh 译文：${key}`);
+			}
+			for (const [key, value] of Object.entries(client.messages.en)) {
+				ok(source.includes(value), `client.js 缺少 en 译文：${key}`);
+			}
+		});
+
+		test('插值占位符在两种语言中一致', () => {
+			const placeholders = (text) => (String(text).match(/\{(\w+)\}/g) || []).sort();
+			for (const key of Object.keys(client.messages.zh)) {
+				deepEq(placeholders(client.messages.en[key]), placeholders(client.messages.zh[key]), `${key} 的占位符不一致`);
+			}
 		});
 	});
 
@@ -885,15 +1086,25 @@ function registerSmokeSuites(use) {
 		let registered;
 		let slotName;
 
-		test('inject 里没有 settingsScope，只有 slots/remote/remote.settings', () => {
-			deepEq(module.inject, ['slots', 'remote', 'remote.settings']);
+		test('inject 里没有 settingsScope，含 slots/remote/remote.settings/locale', () => {
+			deepEq(module.inject, ['slots', 'remote', 'remote.settings', 'locale']);
 			ok(!module.inject.includes('settingsScope'), 'inject 不得包含 settingsScope');
 		});
 
-		test('挂载到 settings.section，id = model-proxy', () => {
+		test('挂载到 settings.section，id = model-proxy，label 走字典', () => {
+			const registeredLocales = [];
 			const ctx = {
 				effect(fn) {
 					fn();
+				},
+				locale: {
+					register(ns, messages) {
+						registeredLocales.push({ ns, messages });
+						return () => {};
+					},
+					bind() {
+						return (key) => key;
+					},
 				},
 				slots: {
 					inject(name, cb) {
@@ -919,15 +1130,71 @@ function registerSmokeSuites(use) {
 			eq(registered.spec.name, 'settings.section');
 			eq(registered.spec.id, 'model-proxy');
 			eq(typeof registered.spec.label, 'function');
+			// bind 被打了桩（返回 key 本身），因此 label 是 key 而不是译文
+			eq(registered.spec.label(), 'sectionLabel');
+
+			// 字典注册了，且中英文都在
+			eq(registeredLocales.length, 1);
+			eq(registeredLocales[0].ns, 'model-proxy');
+			eq(typeof registeredLocales[0].messages.zh, 'object');
+			eq(typeof registeredLocales[0].messages.en, 'object');
+		});
+
+		test('缺少 locale 服务时退回中文，页面不崩', () => {
+			const ctx = {
+				effect(fn) {
+					fn();
+				},
+				slots: {
+					inject(name, cb) {
+						cb();
+						return () => {};
+					},
+					register(spec, component) {
+						registered = { spec, component };
+						return () => {};
+					},
+				},
+				remote: {
+					settings: {
+						describe: async () => ({ ok: true, value: { writable: true, namespaces: [] } }),
+						mutate: async () => ({ ok: true, value: {} }),
+					},
+					$on: () => () => {},
+				},
+			};
+			module.apply(ctx);
 			eq(registered.spec.label(), '模型代理');
 		});
 
 		test('组件可渲染，且包含核心字段', () => {
-			const wrapper = registered.component({});
-			const tree = wrapper.type(wrapper.props);
+			// 用中文兜底渲染（t 由 apply 注入；这里直接给一份）
+			const t = (key, params) => {
+				const table = client.messages.zh;
+				const template = table[key] === undefined ? key : table[key];
+				return String(template).replace(/\{(\w+)\}/g, (m, k) => (params && params[k] !== undefined ? String(params[k]) : m));
+			};
+			const wrapper = registered.component({ t });
+			const tree = wrapper.type(Object.assign({}, wrapper.props, { t }));
 			eq(tree.type, 'div');
 			const text = JSON.stringify(tree);
-			for (const needle of ['模型代理', '模式', '日志级别', '保存']) includes(text, needle);
+			for (const needle of ['模型代理', '模式', '日志级别', '保存', '测试代理', '只代理这些域名', '排除域名']) includes(text, needle);
+		});
+
+		test('域名清单是 tag 编辑器，不再是逗号分隔文本框', () => {
+			// 域名清单只在 rule/custom 模式下渲染，所以这里直接构造组件树：
+			// 用打桩的 useState 让 draft 一开始就是 rule 模式。
+			const t = (key) => key;
+			const wrapper = registered.component({ t });
+			// 组件内部 draft 初值为 null → fromValue(null) → mode 默认 'rule'，
+			// 因此域名清单本来就在树里；这里直接断言结构。
+			const tree = wrapper.type(Object.assign({}, wrapper.props, { t }));
+			const text = JSON.stringify(tree);
+			includes(text, 'mp-hosts');
+			includes(text, 'mp-hosts-add');
+			includes(text, 'hostsRestorePreset');
+			// 旧实现是逗号分隔的单个 input，placeholder 里带逗号提示
+			ok(!text.includes('留空 = 内置预设'), '不应再出现旧文本框的 placeholder');
 		});
 	});
 }
@@ -1019,7 +1286,11 @@ async function loadEntries() {
 		if (name === 'react') return reactStub;
 		throw new Error(`unexpected require: ${name}`);
 	};
-	return { index, clientModule: spec.factory(requireStub) };
+	const clientModule = spec.factory(requireStub);
+	// 客户端把字典内联在 IIFE 里（运行时 require 不到本地模块），
+	// 唯一真源是 lib/i18n.js。两边的 key 集合由 i18n 组核对。
+	const i18n = await import('../lib/i18n.js');
+	return { index, clientModule, messages: i18n.MESSAGES, messageKeys: i18n.MESSAGE_KEYS };
 }
 
 const smokeRun = {};

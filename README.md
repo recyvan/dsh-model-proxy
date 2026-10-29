@@ -126,8 +126,18 @@ entries exist only so `npm test` can run outside DSH; the suite itself prefers t
 - Proxy credentials can only be embedded in the proxy address (`http://user:pass@host:port`),
   which stores them in plain text in settings. Prefer letting the proxy accept loopback
   connections without authentication.
-- Only a single-hop proxy is fully wired; the multi-hop chain interface exists in
-  `lib/core/dispatcher.js` but only the first hop is handed to undici.
+- Proxy **chains** are supported to any depth (each hop's CONNECT is relayed through the previous
+  one, in configuration order). Every hop is a real hop: the chain test suite drives three
+  CONNECT stubs and asserts which port each one dialled.
+
+---
+
+## Verify the connection
+
+The settings page has a **Test proxy** button. It sends one real request through the currently
+configured exit and reports latency, HTTP status and a failure class — never the hostname or the
+response body. This answers the question the diagnostics page cannot: *is it the proxy, or
+something else?*
 
 ---
 

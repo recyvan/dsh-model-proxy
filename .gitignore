@@ -2,3 +2,6 @@ node_modules/
 .DS_Store
 *.log
 *.tgz
+
+# 提交到 DSH 插件市场用的条目文件：属于那个收录仓库，不属于本仓库。
+recyvan__dsh-model-proxy.yml

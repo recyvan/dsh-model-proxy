@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-proxy",
-  "version": "0.2.0",
+  "version": "2.0.0",
   "description": "Route DeepSeek Harness model API requests through a system, custom, or SOCKS proxy; requests outside the configured domains stay direct.",
   "type": "module",
   "license": "MIT",
@@ -39,7 +39,8 @@
     "cordis.patch.yml",
     "config.example.json",
     "README.md",
-    "README_zh.md"
+    "README_zh.md",
+    "CHANGELOG.md"
   ],
   "sideEffects": false,
   "scripts": {
