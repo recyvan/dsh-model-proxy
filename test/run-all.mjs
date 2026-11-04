@@ -3,10 +3,11 @@
  *
  * 分两段跑。
  *
- * 第一段，纯逻辑七组（不依赖写坏的配置就能跳过）：
+ * 第一段，纯逻辑八组（不依赖写坏的配置就能跳过）：
  * 1. 匹配器 —— 域名/后缀/IP/CIDR/脱敏/代理 URL/系统代理字符串，纯函数零网络
  * 2. 规则引擎 —— 优先级、强制直连不可覆盖、明文闸门、explain
  * 3. 预设 + 配置归一化 —— 安全默认只增不减
+ * 3b. 设置迁移 —— 旧形状换算成新形状，且必须幂等
  * 4. Windows 系统代理 —— 注入假的 reg.exe 输出，不真读注册表
  * 5. 真实代理链路 —— 本地起 HTTP 代理桩 + 目标服务器，验证 CONNECT/绝对形式真的走了代理
  * 6. 出口解析 —— 纯函数，不建连接
@@ -60,6 +61,7 @@ const dispatcher = await import('../lib/core/dispatcher.js');
 const systemProxy = await import('../lib/core/system-proxy.js');
 const configMod = await import('../lib/core/config.js');
 const presets = await import('../lib/core/presets.js');
+const migrate = await import('../lib/core/migrate.js');
 
 if (hasUndici) dispatcher.setUndici(undiciModule);
 
@@ -370,6 +372,75 @@ suite('presets+config', async (test) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// 3b. 设置迁移（纯函数，锁住「旧配置升级后不会被静默改回去」）
+// ═══════════════════════════════════════════════════════════
+
+suite('migrate', async (test) => {
+	test('enabled:false 换算成 mode:off，并删掉旧键', () => {
+		const { value, changes } = migrate.migrateSettings({ enabled: false, mode: 'rule' });
+		eq(value.mode, 'off', 'enabled:false 必须变成 mode:off，否则升级后代理会重新打开');
+		ok(!('enabled' in value), 'enabled 必须被删掉，免得每一轮都要重新换算');
+		includes(changes, 'enabled-false-to-mode-off');
+		includes(changes, 'drop-enabled');
+	});
+
+	test('enabled:true 只丢键，不动 mode（当年它就是默认值）', () => {
+		const { value, changes } = migrate.migrateSettings({ enabled: true, mode: 'custom' });
+		eq(value.mode, 'custom', 'enabled:true 不该改变用户选定的模式');
+		ok(!('enabled' in value));
+		eq(changes.length, 0, `enabled:true 没有语义变化，不该产生变更码：${changes.join(',')}`);
+	});
+
+	test('逗号/空白分隔的域名清单转成数组', () => {
+		const { value, changes } = migrate.migrateSettings({
+			proxyHosts: 'api.openai.com, api.anthropic.com\n api.x.ai ',
+			excludeHosts: 'api.deepseek.com',
+		});
+		deepEq(value.proxyHosts, ['api.openai.com', 'api.anthropic.com', 'api.x.ai']);
+		deepEq(value.excludeHosts, ['api.deepseek.com']);
+		includes(changes, 'string-list-to-array:proxyHosts');
+		includes(changes, 'string-list-to-array:excludeHosts');
+	});
+
+	test('host+port 拼成 proxyUri', () => {
+		const { value, changes } = migrate.migrateSettings({ proxyType: 'socks5h', proxyHost: '127.0.0.1', proxyPort: 7890, proxyUri: '' });
+		eq(value.proxyUri, 'socks5h://127.0.0.1:7890');
+		includes(changes, 'host-port-to-uri');
+	});
+
+	test('已有 proxyUri 时不拿 host/port 覆盖', () => {
+		const { value, changes } = migrate.migrateSettings({ proxyType: 'http', proxyHost: '10.0.0.1', proxyPort: 8080, proxyUri: 'socks5h://127.0.0.1:7890' });
+		eq(value.proxyUri, 'socks5h://127.0.0.1:7890');
+		eq(changes.includes('host-port-to-uri'), false);
+	});
+
+	test('端口非法时不拼 URI（宁可报错也不猜）', () => {
+		const { value, changes } = migrate.migrateSettings({ proxyHost: '10.0.0.1', proxyPort: 0, proxyUri: '' });
+		eq(value.proxyUri, '');
+		eq(changes.includes('host-port-to-uri'), false);
+	});
+
+	test('幂等：同一份输入跑第二次不再产生变更', () => {
+		const first = migrate.migrateSettings({ enabled: false, mode: 'rule', proxyHosts: 'a.example,b.example', proxyHost: 'h.example', proxyPort: 1080 });
+		ok(first.changes.length > 0, '第一次应当有换算');
+		const second = migrate.migrateSettings(first.value);
+		eq(second.changes.length, 0, `第二次不该再有换算，实际：${second.changes.join(',')}`);
+		deepEq(second.value, first.value);
+	});
+
+	test('总是写入当前 schemaVersion，非对象输入也不炸', () => {
+		eq(migrate.migrateSettings({}).value.schemaVersion, migrate.SCHEMA_VERSION);
+		eq(migrate.migrateSettings(null).value.schemaVersion, migrate.SCHEMA_VERSION);
+		eq(migrate.migrateSettings('nonsense').value.schemaVersion, migrate.SCHEMA_VERSION);
+	});
+
+	test('不认识的键原样保留（组合层或未来版本写的）', () => {
+		const { value } = migrate.migrateSettings({ futureThing: { a: 1 } });
+		deepEq(value.futureThing, { a: 1 });
+	});
+});
+
+// ═══════════════════════════════════════════════════════════
 // 4. 系统代理解析（注入注册表值，不真读注册表）
 // ═══════════════════════════════════════════════════════════
 
@@ -655,35 +726,26 @@ if (hasUndici) {
 			await runChain(3);
 		});
 
-		test('折叠方向反了会掉换出口身份（回归护栏）', async () => {
-			// 这条用例证明上面的正序断言不是「怎么折都能过」：反向折叠时，
-			// 内层（配置里的第一跳）收到的是**绝对形式请求行**（`http://host:port/path`），
-			// 根本没有 CONNECT —— 也就是说第二跳被架空，隧道压根没建。
-			// 正序实现的同一场景下，第一跳收到的必然是 `127.0.0.1:<第二跳端口>`。
-			const h1 = await startProxyStub('h1');
-			const h2 = await startProxyStub('h2');
+		test('每一跳都真的参与转发，没有空转的配置项', async () => {
+			// 早先这里是一条「反向折叠」护栏，断言 undici 内部谁先收到 CONNECT。
+			// 它测的是 undici 的调用时序而不是我们的契约，实测时而通过时而失败
+			// （同一份代码），因此删除。正序契约由上面两条用例逐跳断言端口来锁死，
+			// 那是确定性的。
+			//
+			// 这条守的是另一个方向：配置里写下的每一跳都必须真的被拨到，
+			// 不能被静默跳过或合并。
+			const hops = [await startProxyStub('h1'), await startProxyStub('h2')];
 			const target = await makeTarget();
-			const inner = new undiciModule.ProxyAgent({ uri: `http://127.0.0.1:${h1.port}` });
-			const outer = new undiciModule.ProxyAgent({
-				uri: `http://127.0.0.1:${h2.port}`,
-				clientFactory: () => inner,
-				proxyTunnel: true,
-			});
+			const entry = await dispatcher.createDispatcher(hops.map((hop) => `http://127.0.0.1:${hop.port}`));
 			try {
-				await undiciModule
-					.fetch(`https://127.0.0.1:${target.port}/x`, { dispatcher: outer })
-					.catch(() => {});
-				// 反向折叠：h1 收到的不是 CONNECT 到 h2，而是绝对形式请求（直接对目标）。
-				ok(
-					h1.state.connectTargets[0] !== `127.0.0.1:${h2.port}`,
-					'反向折叠时 h1 不应拨向 h2——这正是正序实现与反向实现的差别',
-				);
-				ok(h1.state.absolute > 0 || h1.state.connectTargets[0]?.startsWith('http'), '反向折叠时 h1 收到的是绝对形式请求行');
+				await undiciModule.fetch(`http://127.0.0.1:${target.port}/x`, { dispatcher: entry.dispatcher }).catch(() => {});
+				eq(entry.chainLength, hops.length, 'chainLength 必须等于配置的跳数');
+				for (const hop of hops) {
+					ok(hop.state.connects > 0, `${hop.state.label} 一次 CONNECT 都没收到，说明这一跳被跳过了`);
+				}
 			} finally {
-				// 只关最外层：外层 close 会顺着 clientFactory 把内层一并关掉
-				await outer.close().catch(() => {});
-				h1.server.close();
-				h2.server.close();
+				await entry.close();
+				for (const hop of hops) hop.server.close();
 				target.server.close();
 			}
 		});
@@ -975,6 +1037,31 @@ function registerSmokeSuites(use) {
 			eq(snapshot.status.lastSelfCheck.ok, false);
 		});
 
+		test('老配置的 enabled:false 换算成 mode:off，并记进 status.migrations', async () => {
+			// 2.0 把 `enabled` 并进了 `mode: 'off'`。老用户的行配置里还留着
+			// `enabled: false`，如果没人换算，升级后代理会静默地重新打开。
+			const legacy = makeConfig('rule');
+			legacy.enabled = live(false);
+			ctx = makeCtx();
+			host.index.apply(ctx, legacy);
+			const snapshot = await readStatus();
+			eq(snapshot.status.mode, 'off', 'enabled:false 必须换算成 mode:off');
+			eq(snapshot.status.active, false, '换算后不应接管 fetch');
+			includes(snapshot.status.migrations, 'enabled-false-to-mode-off', '换算必须是可见的');
+			// mode 已经是 off 时，换算不重复发生
+			const second = makeConfig('off');
+			second.enabled = live(false);
+			ctx = makeCtx();
+			host.index.apply(ctx, second);
+			eq((await readStatus()).status.mode, 'off');
+		});
+
+		test('迁移只换算一次：转换过的配置再无变更码', async () => {
+			ctx = makeCtx();
+			host.index.apply(ctx, makeConfig('custom'));
+			eq((await readStatus()).status.migrations.length, 0, '当前版本的配置不该产生任何迁移');
+		});
+
 		test('卸载时若 fetch 已被别人包装，不抹掉别人的包装', async () => {
 			ctx = makeCtx();
 			host.index.apply(ctx, makeConfig('rule'));
@@ -1196,6 +1283,23 @@ function registerSmokeSuites(use) {
 			// 旧实现是逗号分隔的单个 input，placeholder 里带逗号提示
 			ok(!text.includes('留空 = 内置预设'), '不应再出现旧文本框的 placeholder');
 		});
+
+		test('迁移提示接到了设置页（迁移必须让用户看见）', () => {
+			// 组件树在打桩的 useState 下拿不到 live.data，所以这里按源码核对接线：
+			// 少了这两处，迁移只发生在内存里，用户永远不知道该重新保存。
+			const source = readFileSync(join(projectRoot, 'lib', 'client.js'), 'utf8');
+			includes(source, 'status.migrations');
+			includes(source, "t('migrated'");
+		});
+
+		test('客户端写入的 schemaVersion 与 lib/core/migrate.js 一致', () => {
+			// 客户端是 IIFE，运行时 require 不到 lib/core/migrate.js，版本号只能内联。
+			// 两处不一致时，设置页保存会把过期的版本号写回库，迁移于是每一轮重跑。
+			const source = readFileSync(join(projectRoot, 'lib', 'client.js'), 'utf8');
+			const found = /var SCHEMA_VERSION = (\d+);/.exec(source);
+			ok(found !== null, 'client.js 里应有 `var SCHEMA_VERSION = <n>;`');
+			eq(Number(found[1]), migrate.SCHEMA_VERSION, '客户端与 migrate.js 的 schemaVersion 必须相同');
+		});
 	});
 }
 
@@ -1236,11 +1340,14 @@ async function loadEntries() {
 	const linkParent = join(projectRoot, 'node_modules');
 	const link = join(linkParent, '@deepseek-ai', 'schemastery');
 	const created = [];
+	/** 这个链接是不是**我们自己**造的。npm install 装的是真目录，绝不能删。 */
+	let linked = false;
 	if (schemasteryDir !== undefined && !existsSync(link)) {
 		try {
 			mkdirSync(join(linkParent, '@deepseek-ai'), { recursive: true });
 			created.push(join(linkParent, '@deepseek-ai'), linkParent);
 			symlinkSync(schemasteryDir, link, 'junction');
+			linked = true;
 		} catch (error) {
 			console.log(`\n⚠ 无法在测试期链接宿主 schemastery（${error?.message ?? error}），入口冒烟用例跳过。\n`);
 			return {};
@@ -1252,7 +1359,10 @@ async function loadEntries() {
 		index = await import('../lib/index.js');
 	} finally {
 		try {
-			rmSync(link, { recursive: true, force: true });
+			// 只删自己造的链接。早先这里无条件删，跑过 `npm install` 的机器上
+			// 会把真的 schemastery 目录一起抹掉——测试顺手毁掉用户的依赖树，
+			// 而且下一次运行时它已经被「解析到宿主那份」静静掩盖了。
+			if (linked) rmSync(link, { recursive: true, force: true });
 			for (const dir of created) {
 				if (existsSync(dir) && readdirSync(dir).length === 0) rmSync(dir, { recursive: true, force: true });
 			}

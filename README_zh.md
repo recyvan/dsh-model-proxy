@@ -21,9 +21,16 @@ dsh plugin --profile <你的 profile> add github:recyvan/dsh-model-proxy
 
 安装后重启 DSH——宿主部分是在 harness 进程内加载的。
 
-需要 **DSH 0.2.1-rc.2 或更新版本**。设置页由宿主按插件的 `Config` schema 生成
-（0.2.x 移除了宿主侧的 `settings` 服务和客户端的 `settingsScope` 服务），
-更老的 harness 会在安装阶段被拒绝。
+需要 **DSH 0.2.1-rc.2 或更新版本**，以及 **Node 22.19+**（harness 自己在 `engines` 里
+标的下限）。设置页由宿主按插件的 `Config` schema 生成（0.2.x 移除了宿主侧的 `settings`
+服务和客户端的 `settingsScope` 服务），更老的 harness 会在安装阶段被拒绝。
+
+### 从 1.x 升级
+
+不需要手动改：升级后第一次启动时，插件在内存里换算旧设置，并在设置页明说。要紧的换算有两条——
+`enabled: false` 变成 `mode: 'off'`（免得你关掉的代理升级后又悄悄开起来），逗号分隔的域名
+清单变成正式的列表。页面提示时可以点一次 **保存**；不点也不会出错，只是每次启动都会重新换算
+一次，而且每次都看得见。
 
 ---
 
@@ -36,8 +43,8 @@ dsh plugin --profile <你的 profile> add github:recyvan/dsh-model-proxy
 | 模式 | `rule`（推荐）/ `system` / `custom` / `off` |
 | 代理协议 | http / https / socks5 / socks5h / socks4 |
 | 代理地址 | `socks5h://127.0.0.1:7890`，或直接写 `127.0.0.1:7890`（协议按“代理协议”字段补齐） |
-| 仅代理这些域名 | 留空 = 内置预设；填写 = 只代理这些（逗号分隔，如 `*.openai.com`、`.aiplatform.googleapis.com`） |
-| 排除域名 | 始终直连，优先级最高 |
+| 仅代理这些域名 | 留空 = 内置预设；否则一条一个标签（如 `*.openai.com`、`.aiplatform.googleapis.com`），回车或「添加」加入 |
+| 排除域名 | 始终直连，优先级最高（同样是标签编辑） |
 
 改动在下一个请求生效，不需要重启。
 
@@ -104,6 +111,9 @@ test/run-all.mjs   测试套件：先跑纯逻辑各组，再跑入口文件冒�
 `undici` 与 `@deepseek-ai/schemastery` 都是 **peer**——宿主已经带了，再装一份会让进程里出现
 两个 dispatcher / `Schema` 实例。`devDependencies` 里的同名条目只是为了让 `npm test`
 能在 DSH 之外跑；测试本身优先用宿主那份。
+
+同一套用例在 GitHub Actions 上每次推送都跑一遍（`.github/workflows/test.yml`，Node 22 / 24）：
+装两个 devDependency → 对 `lib/` 下每个文件 `node --check` → `npm test`。
 
 ---
 

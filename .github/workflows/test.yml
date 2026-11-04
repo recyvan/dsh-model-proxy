@@ -1,0 +1,54 @@
+# 每一次推送都跑一遍全套测试。
+#
+# 为什么值得跑：这套用例里真正拦住过事故的是「入口冒烟」那几组——
+# Config 字段改名、`inject` 列表漂移、设置热更新路径写错，都只有把
+# lib/index.js 和 lib/client.js 真的加载起来才会炸。本地跑得动不代表
+# 换一台干净的机器也跑得动（宿主依赖版本会变），所以放到 CI 上再跑一次。
+
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 是宿主声明的最低线，24 是当前 LTS 的下一档。
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # 只有两个 devDependency：undici（代理链路用例）与 schemastery（入口冒烟用例）。
+      # 插件本身零运行时依赖——undici / schemastery 都取宿主那一份。
+      # 用 `npm ci`：锁文件已提交，版本漂移不会悄悄改变测试结论。
+      - name: Install test dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Syntax check
+        run: |
+          set -e
+          for file in lib/*.js lib/core/*.js; do
+            node --check "$file"
+          done
+
+      # 没装宿主也能跑：测试会先找插件自己的 node_modules，找不到再找 $DSH_HOME。
+      - name: Test
+        run: npm test

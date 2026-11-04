@@ -4,6 +4,35 @@
 
 ---
 
+## [2.1.0] — 2026-11-04
+
+### 新增
+
+- **设置迁移，而且看得见**：`lib/core/migrate.js` 把旧形状换算成当前版本——
+  `enabled: false` → `mode: 'off'`（否则升级后你关掉的代理会悄悄重新打开）、
+  逗号分隔的域名清单 → 数组、`proxyHost`/`proxyPort` → `proxyUri`，并写入
+  `schemaVersion`。发生换算时记进 `status.migrations`，设置页提示「请保存一次」；
+  不保存也不会错，只是每次启动都重新换算一次。换算幂等：同一份输入第二次无变更。
+- **CI**：`.github/workflows/test.yml`，每次推送在 Node 22 / 24 上
+  `npm ci` → 逐文件 `node --check` → 跑全套（纯逻辑 + 两个入口文件冒烟）。
+
+### 变更
+
+- `Config` 新增 `schemaVersion`；设置页保存时一并写回。
+- `package.json` 声明 `engines.node >= 22.19`（宿主自己声明的下限）。
+- 提交 `package-lock.json`，CI 用 `npm ci`，依赖版本不再随 npm 漂移。
+
+### 修复（测试自身）
+
+- **测试收尾会删掉 `node_modules/@deepseek-ai/schemastery`**。清理逻辑无条件
+  `rmSync` 那个路径，`npm install` 之后跑一次测试就把真目录删了——删掉之后
+  测试会安静地改用宿主那份，问题因此一直被掩盖。现在只删测试自己造的临时链接。
+- **删掉「反向折叠」护栏用例**。它断言的是 undici 内部的调用时序，不是本插件的
+  契约，实测同一份代码时而通过时而失败。正序方向由两跳/三跳用例逐跳断言端口锁定，
+  另加一条「配置里的每一跳都真的收到 CONNECT」，不允许空转的配置项。
+
+---
+
 ## [2.0.0] — 2026-10-29
 
 ### 修复
