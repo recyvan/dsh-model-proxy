@@ -5,3 +5,7 @@ node_modules/
 
 # 提交到 DSH 插件市场用的条目文件：属于那个收录仓库，不属于本仓库。
 recyvan__dsh-model-proxy.yml
+
+# 提交信息临时文件（git commit -F 用）
+.git-commit-msg.txt
+.git-tag-msg.txt

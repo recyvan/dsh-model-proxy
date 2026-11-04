@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-proxy",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Route DeepSeek Harness model API requests through a system, custom, or SOCKS proxy; requests outside the configured domains stay direct.",
   "type": "module",
   "license": "MIT",

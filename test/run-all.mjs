@@ -1268,6 +1268,20 @@ function registerSmokeSuites(use) {
 			for (const needle of ['模型代理', '模式', '日志级别', '保存', '测试代理', '只代理这些域名', '排除域名']) includes(text, needle);
 		});
 
+		test('t() 抛错也不会让设置页变成空白', () => {
+			// 真实事故形态：宿主的 locale 一旦在渲染期抛错，异常冒出错误边界，
+			// 用户看到的就是「点了模型代理没反应」——没有任何提示。
+			// 这里把 t 换成一定会抛错的版本，页面必须仍然渲染出中文兜底内容。
+			const bad = () => {
+				throw new Error('locale exploded');
+			};
+			const wrapper = registered.component({ t: bad });
+			const tree = wrapper.type(Object.assign({}, wrapper.props, { t: bad }));
+			eq(tree.type, 'div', '必须退回一个真实节点，而不是空白');
+			const text = JSON.stringify(tree);
+			for (const needle of ['模型代理', '模式', '日志级别', '测试代理']) includes(text, needle);
+		});
+
 		test('域名清单是 tag 编辑器，不再是逗号分隔文本框', () => {
 			// 域名清单只在 rule/custom 模式下渲染，所以这里直接构造组件树：
 			// 用打桩的 useState 让 draft 一开始就是 rule 模式。
