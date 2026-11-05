@@ -9,3 +9,6 @@ recyvan__dsh-model-proxy.yml
 # 提交信息临时文件（git commit -F 用）
 .git-commit-msg.txt
 .git-tag-msg.txt
+
+# 调试用截图（不随包发布）
+.shots/
