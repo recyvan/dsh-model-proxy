@@ -1282,6 +1282,28 @@ function registerSmokeSuites(use) {
 			for (const needle of ['模型代理', '模式', '日志级别', '测试代理']) includes(text, needle);
 		});
 
+		test('域名清单在表单里永远是数组（逗号字符串也吃得下）', () => {
+			// 2.1.1 的真实报错：`list.map is not a function`。
+			// 标签编辑器对清单做 map/slice/indexOf，而 fromValue 曾经把清单转成
+			// 逗号字符串（旧文本框时代的遗留）。设置里只要是**非空**清单，
+			// 整块设置页就会抛错——空清单被 `'' || []` 兜成 []，恰好掩盖了这个 bug。
+			const { fromValue, toList, buildOps } = module.__internals;
+			deepEq(fromValue({ proxyHosts: 'a.example, b.example' }).proxyHosts, ['a.example', 'b.example']);
+			deepEq(fromValue({ proxyHosts: 'a.example, b.example' }).excludeHosts, []);
+			deepEq(fromValue({ proxyHosts: ['a.example'], excludeHosts: [] }).proxyHosts, ['a.example']);
+			deepEq(toList(undefined), []);
+			deepEq(toList(null), []);
+			deepEq(toList('x, y'), ['x', 'y']);
+			deepEq(toList([' x ', '', 'y']), ['x', 'y']);
+			for (const value of ['a,b', ['a'], undefined, null, 42, {}]) {
+				ok(Array.isArray(fromValue({ proxyHosts: value }).proxyHosts), `proxyHosts=${JSON.stringify(value)} 必须转成数组`);
+			}
+			// 保存路径同样要能吃数组（否则改完条目保存会写出错误形状）
+			const ops = buildOps(fromValue({ mode: 'rule', proxyHosts: ['a.example'], excludeHosts: [] }));
+			const set = ops.find((op) => op.op === 'set' && op.path[0] === 'proxyHosts');
+			deepEq(set.value, ['a.example']);
+		});
+
 		test('域名清单是 tag 编辑器，不再是逗号分隔文本框', () => {
 			// 域名清单只在 rule/custom 模式下渲染，所以这里直接构造组件树：
 			// 用打桩的 useState 让 draft 一开始就是 rule 模式。
