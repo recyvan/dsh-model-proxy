@@ -38,6 +38,8 @@ dsh plugin --profile <你的 profile> add github:recyvan/dsh-model-proxy
 
 打开 **设置 → 模型代理**（设置左侧独立一页）。
 
+![模型代理设置页](docs/screenshots/settings.png)
+
 | 字段 | 含义 |
 | --- | --- |
 | 模式 | `rule`（推荐）/ `system` / `custom` / `off` |

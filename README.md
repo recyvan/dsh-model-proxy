@@ -41,6 +41,8 @@ otherwise the conversion is redone, visibly, on every start.
 
 Open **Settings — Model Proxy** (its own page in the settings sidebar).
 
+![Model Proxy settings page](docs/screenshots/settings.png)
+
 | Field | Meaning |
 | --- | --- |
 | Mode | `rule` (recommended) / `system` / `custom` / `off` |
